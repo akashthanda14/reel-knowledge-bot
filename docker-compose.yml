@@ -1,102 +1,128 @@
-# docker-compose.yml — Reel Knowledge Bot
+# docker-compose.yml — Reel Knowledge Bot (3-container architecture)
 #
-# Defines two services built from the same Dockerfile:
-#   bot   — long-running Telegram bot (primary service)
-#   agent — one-shot CLI tool for processing a URL directly, without Telegram
+# Container 1: redis   — job queue and result store
+# Container 2: bot     — Telegram listener, pushes jobs, reads results
+# Container 3: agent   — pops jobs, runs pipeline, pushes results
 #
-# Usage:
-#   Start the bot:                docker compose up bot
-#   Process a URL without Telegram: docker compose run --rm agent python agent.py <url>
+#  User → Telegram → [bot] → Redis jobs:pending → [agent] → Redis result:{id} → [bot] → User
 
-# The Compose file format version.
-# "3.9" is the most recent stable version and supports all features used here.
 version: "3.9"
 
 services:
 
-  # ── bot ──────────────────────────────────────────────────────────────────────
-  # The primary long-running service. Receives reel links over Telegram,
-  # calls process_url() (from agent.py, which is imported directly), and
-  # replies with the extracted knowledge summary.
+  # ── Container 1: Redis ───────────────────────────────────────────────────────
+  # Redis is an in-memory data store used here as a job queue.
+  # bot.py writes to it; agent.py reads from it; agent.py writes results back;
+  # bot.py reads results. No direct connection exists between bot and agent.
+  redis:
+    # Use the official Redis image, Alpine variant.
+    # Alpine Linux is a minimal OS (~5MB) that keeps the image small.
+    # "7" pins to Redis major version 7 — gets patch updates automatically.
+    image: redis:7-alpine
+
+    # Restart automatically if Redis crashes or the machine reboots.
+    restart: unless-stopped
+
+    # healthcheck lets other services use `condition: service_healthy`
+    # in their depends_on block so they don't start before Redis is ready.
+    # test: run `redis-cli ping` inside the container; healthy = it returns PONG.
+    # interval: run the check every 5 seconds.
+    # timeout: fail the check if it takes longer than 3 seconds.
+    # retries: mark unhealthy after 5 consecutive failures.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+    # Persist Redis data to a named volume.
+    # Without this, all queued jobs and results vanish if the container restarts.
+    # Redis appends writes to /data/appendonly.aof (if persistence is enabled)
+    # or takes snapshots to /data/dump.rdb.
+    volumes:
+      - redis_data:/data
+
+  # ── Container 2: bot ─────────────────────────────────────────────────────────
+  # The Telegram-facing service. Receives reel links, pushes jobs to Redis,
+  # waits for results, and replies to the user.
   bot:
-    # Build the image using the Dockerfile in the current directory.
-    # Both services share this same image — same Python environment,
+    # Build the image from the Dockerfile in the current directory.
+    # Both bot and agent use this same image — same Python environment,
     # same installed packages, same source code.
     build: .
 
-    # Override the default CMD in the Dockerfile to run bot.py explicitly.
-    # This makes the intent obvious even though CMD ["python", "bot.py"]
-    # is already the Dockerfile default.
+    # Override the Dockerfile's default CMD so the intent is explicit.
     command: python bot.py
 
-    # Load all environment variables from .env into this container.
-    # .env is never copied into the image (it is in .dockerignore).
-    # The values exist only in the running container's environment.
+    # Load API keys and tokens from .env into the container's environment.
+    # .env is in .dockerignore — it is never copied into the image itself.
     env_file:
       - .env
 
-    # Restart policy: restart the container automatically unless you
-    # explicitly stop it with `docker compose stop` or `docker compose down`.
-    # Handles crashes, OOM kills, and machine reboots (if Docker is set to
-    # start on boot).
-    # Other options: "no" | "always" | "on-failure"
+    # Inject the Redis URL as an environment variable.
+    # "redis" resolves to the Redis container's hostname on Docker's internal
+    # network. Compose creates a private network and assigns each service's
+    # name as its DNS hostname automatically.
+    # This variable is defined here (not in .env) because it's infrastructure
+    # config, not a secret — it changes depending on the deployment environment.
+    environment:
+      REDIS_URL: redis://redis:6379
+
+    # Don't start the bot until Redis passes its healthcheck.
+    # Without this, bot.py would try to connect to Redis before it's ready
+    # and crash immediately.
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    # Restart on crash or reboot — this is a long-running daemon.
     restart: unless-stopped
 
-    # Mount a named volume at /tmp/reels inside the container.
-    # yt-dlp downloads audio here; Whisper reads it, then deletes it.
-    # Using a named volume (rather than the container's ephemeral layer)
-    # means the directory survives container restarts cleanly.
+    # Named volume for temporary audio files.
+    # yt-dlp downloads audio here; Whisper reads and deletes it.
     volumes:
       - audio_tmp:/tmp/reels
 
-  # ── agent ────────────────────────────────────────────────────────────────────
-  # A utility service for running the full pipeline (download → transcribe →
-  # classify → save) from the command line, without going through Telegram.
-  # Useful for testing a URL directly or running one-off jobs.
-  #
-  # Note: agent.py is also imported as a Python module inside bot.py —
-  # the two are not independent microservices. This service is a separate
-  # container that runs agent.py in CLI mode.
-  #
-  # Typical usage (run once, then remove the container):
-  #   docker compose run --rm agent python agent.py <url>
+  # ── Container 3: agent ───────────────────────────────────────────────────────
+  # The processing worker. Blocks on the Redis job queue, runs the full
+  # download → transcribe → classify → save pipeline for each job,
+  # and pushes the result back to Redis for the bot to read.
   agent:
-    # Reuse the same image as the bot service.
-    # No rebuild needed — both containers are identical environments.
+    # Same image as bot — the Dockerfile is built once and shared.
     build: .
 
-    # Default command when you run `docker compose up agent`.
-    # Without a URL argument, agent.py prompts for input.
-    # In practice, override this on the command line:
-    #   docker compose run --rm agent python agent.py https://...
+    # agent.py's __main__ now runs the worker loop, not the CLI prompt.
     command: python agent.py
 
-    # Same .env file as the bot service.
-    # Both containers get the same API keys and tokens.
+    # Same .env file — agent needs OPENAI_API_KEY, NOTION_TOKEN,
+    # NOTION_DATABASE_ID to run the pipeline.
     env_file:
       - .env
 
-    # Keep open an interactive stdin channel so you can type a URL
-    # when running without arguments.
-    stdin_open: true
+    # Same Redis URL — agent reads from jobs:pending and writes to result:{id}.
+    environment:
+      REDIS_URL: redis://redis:6379
 
-    # Allocate a pseudo-TTY so terminal output (colours, progress bars
-    # from yt-dlp and Whisper) renders correctly.
-    tty: true
+    # Agent also waits for Redis to be healthy before starting.
+    depends_on:
+      redis:
+        condition: service_healthy
 
-    # Restart policy: "no" means the agent container is not restarted
-    # automatically. It is a one-shot CLI tool — it processes a URL and exits.
-    # Restarting it after exit would just prompt for another URL indefinitely.
-    restart: "no"
+    # Restart automatically — if a job causes an unhandled exception that
+    # escapes the worker loop, the container restarts and picks up the next job.
+    restart: unless-stopped
 
-    # Share the same named volume so audio files written during a manual
-    # agent run land in the same place as bot-triggered runs.
+    # Same named volume — audio files written by yt-dlp and read by Whisper
+    # live here. Survives container restarts mid-download.
     volumes:
       - audio_tmp:/tmp/reels
 
 # ── Named volumes ─────────────────────────────────────────────────────────────
-# Declaring a volume here registers it with Docker so it persists across
-# `docker compose down` (without --volumes).
-# Both services mount audio_tmp at /tmp/reels.
+# Declared here so Docker manages them as first-class objects.
+# They persist across `docker compose down` (but not `docker compose down --volumes`).
 volumes:
+  # Redis persistence — keeps queued jobs and results across Redis restarts.
+  redis_data:
+
+  # Shared audio temp storage — used by both bot and agent containers.
   audio_tmp:
