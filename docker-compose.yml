@@ -1,0 +1,102 @@
+# docker-compose.yml — Reel Knowledge Bot
+#
+# Defines two services built from the same Dockerfile:
+#   bot   — long-running Telegram bot (primary service)
+#   agent — one-shot CLI tool for processing a URL directly, without Telegram
+#
+# Usage:
+#   Start the bot:                docker compose up bot
+#   Process a URL without Telegram: docker compose run --rm agent python agent.py <url>
+
+# The Compose file format version.
+# "3.9" is the most recent stable version and supports all features used here.
+version: "3.9"
+
+services:
+
+  # ── bot ──────────────────────────────────────────────────────────────────────
+  # The primary long-running service. Receives reel links over Telegram,
+  # calls process_url() (from agent.py, which is imported directly), and
+  # replies with the extracted knowledge summary.
+  bot:
+    # Build the image using the Dockerfile in the current directory.
+    # Both services share this same image — same Python environment,
+    # same installed packages, same source code.
+    build: .
+
+    # Override the default CMD in the Dockerfile to run bot.py explicitly.
+    # This makes the intent obvious even though CMD ["python", "bot.py"]
+    # is already the Dockerfile default.
+    command: python bot.py
+
+    # Load all environment variables from .env into this container.
+    # .env is never copied into the image (it is in .dockerignore).
+    # The values exist only in the running container's environment.
+    env_file:
+      - .env
+
+    # Restart policy: restart the container automatically unless you
+    # explicitly stop it with `docker compose stop` or `docker compose down`.
+    # Handles crashes, OOM kills, and machine reboots (if Docker is set to
+    # start on boot).
+    # Other options: "no" | "always" | "on-failure"
+    restart: unless-stopped
+
+    # Mount a named volume at /tmp/reels inside the container.
+    # yt-dlp downloads audio here; Whisper reads it, then deletes it.
+    # Using a named volume (rather than the container's ephemeral layer)
+    # means the directory survives container restarts cleanly.
+    volumes:
+      - audio_tmp:/tmp/reels
+
+  # ── agent ────────────────────────────────────────────────────────────────────
+  # A utility service for running the full pipeline (download → transcribe →
+  # classify → save) from the command line, without going through Telegram.
+  # Useful for testing a URL directly or running one-off jobs.
+  #
+  # Note: agent.py is also imported as a Python module inside bot.py —
+  # the two are not independent microservices. This service is a separate
+  # container that runs agent.py in CLI mode.
+  #
+  # Typical usage (run once, then remove the container):
+  #   docker compose run --rm agent python agent.py <url>
+  agent:
+    # Reuse the same image as the bot service.
+    # No rebuild needed — both containers are identical environments.
+    build: .
+
+    # Default command when you run `docker compose up agent`.
+    # Without a URL argument, agent.py prompts for input.
+    # In practice, override this on the command line:
+    #   docker compose run --rm agent python agent.py https://...
+    command: python agent.py
+
+    # Same .env file as the bot service.
+    # Both containers get the same API keys and tokens.
+    env_file:
+      - .env
+
+    # Keep open an interactive stdin channel so you can type a URL
+    # when running without arguments.
+    stdin_open: true
+
+    # Allocate a pseudo-TTY so terminal output (colours, progress bars
+    # from yt-dlp and Whisper) renders correctly.
+    tty: true
+
+    # Restart policy: "no" means the agent container is not restarted
+    # automatically. It is a one-shot CLI tool — it processes a URL and exits.
+    # Restarting it after exit would just prompt for another URL indefinitely.
+    restart: "no"
+
+    # Share the same named volume so audio files written during a manual
+    # agent run land in the same place as bot-triggered runs.
+    volumes:
+      - audio_tmp:/tmp/reels
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+# Declaring a volume here registers it with Docker so it persists across
+# `docker compose down` (without --volumes).
+# Both services mount audio_tmp at /tmp/reels.
+volumes:
+  audio_tmp:
