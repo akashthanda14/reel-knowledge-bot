@@ -6,3 +6,10 @@ requests==2.33.1
 python-telegram-bot==22.7
 yt-dlp==2026.3.17
 redis==7.4.0
+
+# RAG + orchestration
+qdrant-client==1.17.1
+langchain-qdrant==1.1.0
+langgraph==1.1.6
+langchain-openai==1.1.12
+langchain-core==1.2.28
