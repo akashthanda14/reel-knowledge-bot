@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
 
+from qdrant_helper import search_reels, store_reel
+
 load_dotenv()
 
 # FastMCP exposes regular Python functions as tools callable by the agent.
@@ -184,6 +186,111 @@ def _extract_text(prop: dict) -> str:
     else:
         return ""
     return "".join(item.get("plain_text", "") for item in items)
+
+
+# ── RAG tools ─────────────────────────────────────────────────────────────────
+# The two tools below implement the RAG (Retrieval-Augmented Generation) pattern.
+#
+# RAG = storing knowledge as vectors so the agent can retrieve relevant
+# context before generating an answer, rather than relying on model memory alone.
+#
+# embed_and_store → the "Augmented" write side: save new knowledge into the vector DB.
+# get_similar_reels → the "Retrieval" read side: fetch relevant knowledge at query time.
+
+
+# RAG pattern — memory write
+# Every time a reel is ingested, this tool creates a vector embedding of the
+# transcript and stores it in Qdrant alongside the metadata. This is the moment
+# RAG memory is created: the transcript moves from ephemeral text into a
+# persistent, searchable vector index that the agent can query later.
+@mcp.tool()
+def embed_and_store(
+    text: str,
+    topic: str,
+    subtopic: str,
+    source_url: str,
+    summary: str,
+) -> str:
+    """Embed a reel transcript and store it in the Qdrant vector database.
+
+    Converts the transcript text into a 1536-dimension vector using
+    OpenAI text-embedding-3-small, then saves the vector and metadata
+    as a searchable point in the 'reels' Qdrant collection.
+
+    Args:
+        text:       Full transcript text to embed.
+        topic:      Top-level topic (e.g. "Technology").
+        subtopic:   Specific subtopic (e.g. "AI & Machine Learning").
+        source_url: Original reel URL — stored for attribution.
+        summary:    Bullet-point summary that was saved to Notion.
+
+    Returns:
+        "Stored successfully with id: {uuid}" on success, or an error string.
+    """
+    # This is where RAG memory is created.
+    try:
+        metadata = {
+            "topic": topic,
+            "subtopic": subtopic,
+            "source_url": source_url,
+            "summary": summary,
+        }
+        # store_reel embeds text, builds a PointStruct, and upserts into Qdrant.
+        # It returns the UUID assigned to this point in the collection.
+        point_id = store_reel(text, metadata)
+        return f"Stored successfully with id: {point_id}"
+    except Exception as e:
+        return f"Error storing in Qdrant: {e}"
+
+
+# RAG pattern — memory retrieval
+# When the user asks a question, this tool converts the question into a vector
+# and searches Qdrant for the most similar transcript vectors. The results give
+# the agent factual context from previously saved reels before it generates
+# an answer — this is the core RAG retrieval step.
+@mcp.tool()
+def get_similar_reels(query: str, limit: int = 5) -> str:
+    """Search the Qdrant vector database for reels semantically similar to a query.
+
+    Embeds the query string using the same model used at ingest time
+    (text-embedding-3-small), then returns the closest matching reel
+    transcripts ranked by cosine similarity score.
+
+    Args:
+        query: A natural-language question or topic, e.g.
+               "What did I learn about sleep and recovery?"
+        limit: Maximum number of results to return. Default 5.
+
+    Returns:
+        A formatted string listing each result with its score, summary,
+        and topic — ready for the agent to read and use as context.
+        Returns an error string if the search fails.
+    """
+    # This is where RAG retrieval happens.
+    try:
+        results = search_reels(query, limit)
+
+        if not results:
+            return "No similar reels found."
+
+        # Format each result as a readable line for the agent.
+        # The agent reads this text and uses it as grounding context
+        # before generating its answer to the user.
+        lines = []
+        for i, reel in enumerate(results, start=1):
+            score = round(reel["score"], 2)
+            summary = reel["summary"] or reel["text"][:120]
+            topic = reel["topic"]
+            subtopic = reel["subtopic"]
+            source = reel["source_url"]
+            lines.append(
+                f"Reel {i} (score: {score}): {summary} | "
+                f"Topic: {topic} / {subtopic} | Source: {source}"
+            )
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error searching Qdrant: {e}"
 
 
 if __name__ == "__main__":
