@@ -1,10 +1,13 @@
-# docker-compose.yml — Reel Knowledge Bot (3-container architecture)
+# docker-compose.yml — Reel Knowledge Bot (4-container architecture)
 #
 # Container 1: redis   — job queue and result store
-# Container 2: bot     — Telegram listener, pushes jobs, reads results
-# Container 3: agent   — pops jobs, runs pipeline, pushes results
+# Container 2: qdrant  — vector database for semantic search (RAG)
+# Container 3: bot     — Telegram listener, pushes jobs, reads results
+# Container 4: agent   — pops jobs, runs pipeline, pushes results
 #
 #  User → Telegram → [bot] → Redis jobs:pending → [agent] → Redis result:{id} → [bot] → User
+#                                                     ↕
+#                                               [qdrant] (embed + search)
 
 version: "3.9"
 
@@ -42,7 +45,44 @@ services:
     volumes:
       - redis_data:/data
 
-  # ── Container 2: bot ─────────────────────────────────────────────────────────
+  # ── Container 2: Qdrant ──────────────────────────────────────────────────────
+  # Qdrant is the vector database. It stores embeddings of reel transcripts
+  # so the agent can do semantic search ("find reels similar to this question").
+  # It runs here as a Docker service — no local install needed.
+  # Python code connects to it via qdrant-client using QDRANT_URL.
+  qdrant:
+    # Official Qdrant image. No Alpine variant — Qdrant doesn't publish one.
+    # Pinning to v1.14.0 keeps builds reproducible.
+    image: qdrant/qdrant:v1.14.0
+
+    # Restart automatically if Qdrant crashes or the machine reboots.
+    restart: unless-stopped
+
+    # Qdrant exposes two ports:
+    #   6333 — REST API (used by qdrant-client by default)
+    #   6334 — gRPC API (used by qdrant-client when grpc=True)
+    # "host:container" format. Both are exposed so you can hit the
+    # Qdrant dashboard at http://localhost:6333/dashboard in your browser.
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+
+    # healthcheck pings the Qdrant REST readiness endpoint.
+    # /readyz returns HTTP 200 when Qdrant is fully initialised and
+    # ready to accept requests.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    # Mount a named volume so Qdrant's collection data (vectors + payloads)
+    # survives container restarts. Without this, every restart wipes all
+    # stored embeddings and you'd have to re-ingest every reel.
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  # ── Container 3: bot ─────────────────────────────────────────────────────────
   # The Telegram-facing service. Receives reel links, pushes jobs to Redis,
   # waits for results, and replies to the user.
   bot:
@@ -59,20 +99,19 @@ services:
     env_file:
       - .env
 
-    # Inject the Redis URL as an environment variable.
-    # "redis" resolves to the Redis container's hostname on Docker's internal
-    # network. Compose creates a private network and assigns each service's
-    # name as its DNS hostname automatically.
-    # This variable is defined here (not in .env) because it's infrastructure
-    # config, not a secret — it changes depending on the deployment environment.
+    # Infrastructure URLs are defined here rather than in .env because they
+    # are deployment-specific (they change between local/staging/prod) and
+    # are not secrets. "redis" and "qdrant" resolve to those service hostnames
+    # on Docker Compose's internal network automatically.
     environment:
       REDIS_URL: redis://redis:6379
+      QDRANT_URL: http://qdrant:6333
 
-    # Don't start the bot until Redis passes its healthcheck.
-    # Without this, bot.py would try to connect to Redis before it's ready
-    # and crash immediately.
+    # Don't start the bot until both Redis and Qdrant pass their healthchecks.
     depends_on:
       redis:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
 
     # Restart on crash or reboot — this is a long-running daemon.
@@ -99,13 +138,16 @@ services:
     env_file:
       - .env
 
-    # Same Redis URL — agent reads from jobs:pending and writes to result:{id}.
+    # Agent needs both Redis (job queue) and Qdrant (embed + search).
     environment:
       REDIS_URL: redis://redis:6379
+      QDRANT_URL: http://qdrant:6333
 
-    # Agent also waits for Redis to be healthy before starting.
+    # Agent waits for both Redis and Qdrant to be healthy before starting.
     depends_on:
       redis:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
 
     # Restart automatically — if a job causes an unhandled exception that
@@ -123,6 +165,10 @@ services:
 volumes:
   # Redis persistence — keeps queued jobs and results across Redis restarts.
   redis_data:
+
+  # Qdrant persistence — keeps all stored vectors and payloads across restarts.
+  # Losing this means re-ingesting every reel to rebuild the search index.
+  qdrant_data:
 
   # Shared audio temp storage — used by both bot and agent containers.
   audio_tmp:
