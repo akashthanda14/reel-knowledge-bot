@@ -1,0 +1,30 @@
+# Secrets — never bake into the image; pass at runtime via --env-file .env
+.env
+.env.local
+
+# Virtual environment — Docker installs its own packages inside the image
+venv/
+
+# Byte-compiled Python files — regenerated automatically inside the container
+__pycache__/
+*.pyc
+*.pyo
+
+# Git history — not needed to run the app
+.git/
+.gitignore
+
+# Claude Code internal files
+.claude/
+
+# Documentation — not needed at runtime
+docs/
+README.md
+LICENSE
+
+# Test files — not needed in production image
+test_server.py
+
+# Docker files themselves
+Dockerfile
+.dockerignore
