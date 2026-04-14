@@ -38,14 +38,21 @@ JOB_QUEUE = "jobs:pending"
 RESULT_TTL = 600
 
 SYSTEM_PROMPT = """You are a knowledge extraction agent.
-Given a reel URL you must:
+Given a reel URL you must follow these steps in order:
 1. Call download_reel to download the audio.
 2. Call transcribe_audio with the returned file path.
 3. Call get_existing_topics to see what topics already exist in Notion.
-4. Analyse the transcript: extract 3–7 key concepts, determine the best topic and subtopic
+4. Analyse the transcript: extract 3-7 key concepts, determine the best topic and subtopic
    (reuse an existing topic/subtopic when it fits, otherwise create a new one).
 5. Call save_to_notion with topic, subtopic, and a clean structured summary of the key concepts.
-6. Reply with a short confirmation: topic, subtopic, and bullet-point key concepts.
+6. Call embed_and_store with:
+   - text: the full transcript
+   - topic: same topic you used in save_to_notion
+   - subtopic: same subtopic
+   - source_url: the original reel URL the user sent
+   - summary: the same bullet-point summary you saved to Notion
+   This stores the knowledge in the vector search database for future retrieval.
+7. Reply with a short confirmation: topic, subtopic, and bullet-point key concepts.
 
 Format the content you pass to save_to_notion as plain text bullet points."""
 
@@ -74,6 +81,7 @@ async def process_url(url: str) -> str:
     server_params = StdioServerParameters(
         command="python",
         args=["server.py"],
+        env=os.environ.copy(),
     )
 
     async with stdio_client(server_params) as (read, write):
@@ -88,6 +96,7 @@ async def process_url(url: str) -> str:
                 {"role": "user", "content": f"Process this reel: {url}"},
             ]
             saved_to_notion = False
+            embedded_in_qdrant = False
             last_save_result = ""
 
             while True:
@@ -102,6 +111,7 @@ async def process_url(url: str) -> str:
                 messages.append(msg)
 
                 if not msg.tool_calls:
+                    # Hard-enforce save_to_notion — no final answer without it.
                     if not saved_to_notion:
                         messages.append(
                             {
@@ -110,6 +120,20 @@ async def process_url(url: str) -> str:
                                     "You must call save_to_notion before your final response. "
                                     "Call save_to_notion now with the best topic, subtopic, and "
                                     "plain-text bullet summary, then confirm to the user."
+                                ),
+                            }
+                        )
+                        continue
+
+                    # Soft-enforce embed_and_store — nudge once, don't block on failure.
+                    if not embedded_in_qdrant:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "You still need to call embed_and_store to save this reel "
+                                    "to the vector search database. Call it now with the full "
+                                    "transcript, topic, subtopic, source_url, and summary."
                                 ),
                             }
                         )
@@ -131,6 +155,9 @@ async def process_url(url: str) -> str:
                     if name == "save_to_notion":
                         saved_to_notion = True
                         last_save_result = output
+
+                    if name == "embed_and_store":
+                        embedded_in_qdrant = True
 
                     messages.append(
                         {

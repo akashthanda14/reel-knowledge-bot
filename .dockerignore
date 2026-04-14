@@ -20,6 +20,9 @@ __pycache__/
 # Documentation — not needed at runtime
 docs/
 README.md
+GUIDE.md
+QUICKSTART.md
+LECTURE.md
 LICENSE
 
 # Test files — not needed in production image

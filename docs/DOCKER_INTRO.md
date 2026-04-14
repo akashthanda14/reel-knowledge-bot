@@ -54,4 +54,4 @@ Container  ──── your app is running
 
 ## See also
 
-- [`DOCKERFILE_EXPLAINED.md`](DOCKERFILE_EXPLAINED.md) — the actual 5-line Dockerfile with line-by-line breakdown
+- `Dockerfile` in the project root — the actual Dockerfile for this project

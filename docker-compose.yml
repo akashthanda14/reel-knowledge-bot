@@ -9,8 +9,6 @@
 #                                                     ↕
 #                                               [qdrant] (embed + search)
 
-version: "3.9"
-
 services:
 
   # ── Container 1: Redis ───────────────────────────────────────────────────────
@@ -71,7 +69,7 @@ services:
     # /readyz returns HTTP 200 when Qdrant is fully initialised and
     # ready to accept requests.
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:6333/readyz || exit 1"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' 2>/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5

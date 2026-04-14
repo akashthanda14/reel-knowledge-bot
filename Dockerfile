@@ -5,37 +5,13 @@
 FROM python:3.11-slim
 
 # ── System dependencies ───────────────────────────────────────────────────────
-# apt-get update refreshes the package list so apt knows what's available.
-# apt-get install -y installs without prompting for confirmation.
-#   ffmpeg   — required by yt-dlp to convert/mux audio after download,
-#              and by openai-whisper to decode audio before transcription.
-#   curl     — used below to download the Deno installer script.
-#   unzip    — used by the Deno installer to unpack the binary archive.
-# The final && rm -rf /var/lib/apt/lists/* deletes the package index cache
-# that apt-get update created. Those files are no longer needed and would
-# just add size to the image layer.
+# ffmpeg is required by yt-dlp to convert/mux audio after download,
+# and by openai-whisper to decode audio before transcription.
+# The final && rm -rf /var/lib/apt/lists/* removes the package index cache
+# so it doesn't add unnecessary size to the image layer.
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    curl \
-    unzip \
     && rm -rf /var/lib/apt/lists/*
-
-# ── Deno ──────────────────────────────────────────────────────────────────────
-# Download and run the official Deno install script.
-# -f   fail silently on server errors (no half-downloaded output)
-# -s   silent mode (no progress bar)
-# -S   show errors even in silent mode
-# -L   follow redirects
-# The script installs the Deno binary to /root/.deno/bin/deno by default.
-RUN curl -fsSL https://deno.land/install.sh | sh
-
-# Tell the shell where Deno lives.
-# DENO_INSTALL is the root folder the installer created.
-ENV DENO_INSTALL="/root/.deno"
-
-# Prepend the Deno bin directory to PATH so every subsequent RUN, CMD, and
-# ENTRYPOINT can find the `deno` command without a full path.
-ENV PATH="${DENO_INSTALL}/bin:${PATH}"
 
 # ── Working directory ─────────────────────────────────────────────────────────
 # Create (if it doesn't exist) and switch into /app inside the container.
